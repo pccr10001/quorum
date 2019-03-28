@@ -81,6 +81,7 @@ const (
 type environment struct {
 	signer types.Signer
 
+	stateMu   sync.RWMutex
 	state     *state.StateDB // apply state changes here
 	ancestors mapset.Set     // ancestor set (used for checking uncle parent validity)
 	family    mapset.Set     // family set (used for checking uncle invalidity)
@@ -259,8 +260,12 @@ func (w *worker) setRecommitInterval(interval time.Duration) {
 // pending returns the pending state and corresponding block.
 func (w *worker) pending() (*types.Block, *state.StateDB, *state.StateDB) {
 	// return a snapshot to avoid contention on currentMu mutex
+
 	w.snapshotMu.RLock()
 	defer w.snapshotMu.RUnlock()
+	w.current.stateMu.RLock()
+	defer w.current.stateMu.RUnlock()
+
 	if w.snapshotState == nil {
 		return nil, nil, nil
 	}
@@ -478,6 +483,7 @@ func (w *worker) mainLoop() {
 				w.mu.RLock()
 				coinbase := w.coinbase
 				w.mu.RUnlock()
+				w.current.stateMu.Lock()
 
 				txs := make(map[common.Address]types.Transactions)
 				for _, tx := range ev.Txs {
@@ -487,6 +493,7 @@ func (w *worker) mainLoop() {
 				txset := types.NewTransactionsByPriceAndNonce(w.current.signer, txs)
 				w.commitTransactions(txset, coinbase, nil)
 				w.updateSnapshot()
+				w.current.stateMu.Unlock()
 			} else {
 				// If we're mining, but nothing is being processed, wake on new transactions
 				if w.config.Clique != nil && w.config.Clique.Period == 0 {
@@ -595,6 +602,8 @@ func (w *worker) resultLoop() {
 				}
 			}
 
+			work.stateMu.Lock()
+
 			for _, log := range append(work.state.Logs(), work.privateState.Logs()...) {
 				log.BlockHash = hash
 			}
@@ -616,6 +625,8 @@ func (w *worker) resultLoop() {
 				continue
 			}
 
+			work.stateMu.Unlock()
+
 			log.Info("Successfully sealed new block", "number", block.Number(), "sealhash", sealhash, "hash", hash,
 				"elapsed", common.PrettyDuration(time.Since(task.createdAt)))
 
@@ -623,7 +634,10 @@ func (w *worker) resultLoop() {
 			w.mux.Post(core.NewMinedBlockEvent{Block: block})
 
 			var events []interface{}
+
+			work.stateMu.RLock()
 			logs = append(work.state.Logs(), work.privateState.Logs()...)
+			work.stateMu.RUnlock()
 
 			switch stat {
 			case core.CanonStatTy:
@@ -939,6 +953,10 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		log.Error("Failed to create mining context", "err", err)
 		return
 	}
+
+	w.current.stateMu.Lock()
+	defer w.current.stateMu.Unlock()
+
 	// Create the current work task and check any fork transitions needed
 	env := w.current
 	if w.config.DAOForkSupport && w.config.DAOForkBlock != nil && w.config.DAOForkBlock.Cmp(header.Number) == 0 {
